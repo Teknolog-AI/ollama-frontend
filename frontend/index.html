@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gürkan AI</title>
+    <link rel="stylesheet" href="index.css">
+</head>
+<body>
+    <main class="chat-app">
+        <header>
+            <div>
+                <h1>Yazılım Eğitimi ve Yapay Zeka Eğitimi</h1>
+                <p>Yazılım ve AI Eğitimi alanında Uzman Yapay Zeka Asistanıdır.</p>
+            </div>
+
+            <select id="modelSelect"></select>
+        </header>
+
+        <section id="messages" class="messages">
+        <div class="message assistant">
+        Hangi konuda eğitim almak istiyorsunuz?
+         </div>
+        </section>
+
+        <form id="chatForm">
+            <textarea
+                id="messageInput"
+                placeholder="Mesajınızı yazın..."
+                rows="1"
+                required
+            ></textarea>
+
+            
+            <button type="submit">Gönder</button>
+        </form>
+    </main>
+
+    <script src="index.js"></script>
+</body>
+</html>
