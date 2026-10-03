@@ -4,38 +4,47 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gürkan AI</title>
-    <link rel="stylesheet" href="index.css">
+    <link rel="stylesheet" href="/assets/index.css">
 </head>
 <body>
     <main class="chat-app">
         <header>
-            <div>
+            <div class="heading">
                 <h1>Yazılım Eğitimi ve Yapay Zeka Eğitimi</h1>
-                <p>Yazılım ve AI Eğitimi alanında Uzman Yapay Zeka Asistanıdır.</p>
+                <p>Gürkan AI ile öğrenin, sorun ve açık kaynak projeleri keşfedin.</p>
             </div>
-
-            <select id="modelSelect" aria-label="Yapay zeka modeli seçin"></select>
+            <div class="header-controls">
+                <label for="modelSelect">Yapay zeka modeli</label>
+                <select id="modelSelect" disabled><option value="">Modeller yükleniyor…</option></select>
+                <button id="newChatButton" type="button" class="secondary">Yeni sohbet</button>
+            </div>
         </header>
 
-        <section id="messages" class="messages">
-        <div class="message assistant">
-        Hangi konuda eğitim almak istiyorsunuz?
-         </div>
+        <div class="status-bar">
+            <p id="status" role="status" aria-live="polite">Modeller kontrol ediliyor…</p>
+            <button id="retryModelsButton" type="button" class="secondary" hidden>Modelleri yeniden yükle</button>
+        </div>
+
+        <section id="messages" class="messages" role="log" aria-label="Sohbet mesajları" aria-live="polite" aria-relevant="additions text">
+            <div class="message assistant">Hangi konuda eğitim almak istiyorsunuz?</div>
         </section>
 
-        <form id="chatForm">
-            <textarea
-                id="messageInput"
-                placeholder="Mesajınızı yazın..."
-                rows="1"
-                required
-            ></textarea>
-
-            
-            <button type="submit">Gönder</button>
-        </form>
+        <footer>
+            <div class="chat-options">
+                <label class="remember"><input id="rememberChat" type="checkbox"> Bu cihazda sohbeti hatırla</label>
+                <button id="retryMessageButton" type="button" class="secondary" hidden>Mesajı yeniden dene</button>
+            </div>
+            <form id="chatForm">
+                <label class="visually-hidden" for="messageInput">Mesajınız</label>
+                <textarea id="messageInput" placeholder="Mesajınızı yazın…" rows="2" required disabled></textarea>
+                <div class="send-controls">
+                    <button id="sendButton" type="submit" disabled>Gönder</button>
+                    <button id="stopButton" type="button" class="secondary" hidden>Durdur</button>
+                </div>
+            </form>
+            <p class="hint">Enter ile gönder · Shift + Enter ile yeni satır. Model değiştirildiğinde yeni sohbet başlar.</p>
+        </footer>
     </main>
-
-    <script src="index.js"></script>
+    <script type="module" src="/assets/index.js"></script>
 </body>
 </html>
