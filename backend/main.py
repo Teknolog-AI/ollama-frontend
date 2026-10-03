@@ -1,246 +1,107 @@
-from typing import Literal
-import json
-from urllib import error, request
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Annotated
+
 import httpx
-
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 
-app = FastAPI()
+from backend.config import ROOT, Settings
+from backend.errors import ServiceError
+from backend.models import ChatRequest, ChatResponse, GitHubSearchArguments, client_limits
+from backend.services.chat import ChatService
+from backend.services.github import GitHubService
+from backend.services.ollama import OllamaService
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5500", "http://localhost:5500"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
-GITHUB_API_URL = "https://api.github.com"
+async def until_disconnect(request: Request):
+    # FastAPI has already consumed the request body before entering the route.
+    # Await the ASGI event directly so task cancellation is not swallowed by a
+    # nested cancellation scope in a polling implementation.
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
 
-GITHUB_HEADERS = {
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2026-03-10",
-    "User-Agent": "Gurkan-AI"
-}
 
-# Ollama tool definition for GitHub search
-GITHUB_SEARCH_TOOL = {
-    "name": "search_github_repositories",
-    "description": "Search GitHub repositories by query. Returns a list of repositories.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string"},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 10}
-        },
-        "required": ["query"]
-    }
-}
+def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
+    settings = settings or Settings()
 
-ALLOWED_MODELS = [
-    "qwen3.5:4b-q4_K_M",
-    "gurkan-ai",
-]
-async def search_github_repositories(
-    query: str,
-    limit: int = 5
-) -> list[dict]:
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(
-                f"{GITHUB_API_URL}/search/repositories",
-                params={
-                    "q": query,
-                    "sort": "stars",
-                    "order": "desc",
-                    "per_page": limit
-                },
-                headers=GITHUB_HEADERS
-            )
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"GitHub bağlantısı kurulamadı: {exc}"
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with httpx.AsyncClient(transport=transport) as client:
+            app.state.ollama = OllamaService(client, settings)
+            app.state.github = GitHubService(client, settings)
+            app.state.chat = ChatService(app.state.ollama, app.state.github, settings)
+            yield
+
+    app = FastAPI(title="Gürkan AI", lifespan=lifespan)
+    if settings.cors_origins:
+        app.add_middleware(
+            CORSMiddleware, allow_origins=settings.cors_origins,
+            allow_credentials=False, allow_methods=["GET", "POST"], allow_headers=["Content-Type"],
         )
 
-    if response.status_code == 403:
-        raise HTTPException(
-            status_code=429,
-            detail="GitHub API kullanım sınırına ulaşıldı"
-        )
+    @app.exception_handler(ServiceError)
+    async def service_error(_request: Request, exc: ServiceError):
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+        return JSONResponse(status_code=exc.status, content={"detail": exc.message, "code": exc.code}, headers=headers)
 
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"GitHub API hatası: {response.status_code}"
-        )
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, _exc: RequestValidationError):
+        return JSONResponse(status_code=422, content={
+            "detail": "Mesaj veya arama bilgisi geçersiz. Boş içerik göndermeyin; uzun sohbetlerde yeni sohbet başlatın.",
+            "code": "validation_error",
+        })
 
-    repositories = response.json().get("items", [])
-
-    return [
-        {
-            "name": repo["full_name"],
-            "owner": repo["owner"]["login"],
-            "description": repo["description"],
-            "language": repo["language"],
-            "stars": repo["stargazers_count"],
-            "forks": repo["forks_count"],
-            "url": repo["html_url"]
+    @app.get("/models")
+    async def get_models():
+        return {
+            "models": await app.state.ollama.models(), "limits": client_limits(),
+            "request_timeout_ms": int(settings.chat_timeout_seconds * 1000) + 5_000,
         }
-        for repo in repositories
-    ]
+
+    @app.post("/chat", response_model=ChatResponse)
+    async def chat(payload: ChatRequest, request: Request):
+        task = asyncio.create_task(app.state.chat.chat(payload))
+        disconnected = asyncio.create_task(until_disconnect(request))
+        try:
+            done, _ = await asyncio.wait({task, disconnected}, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                return task.result()
+            raise ServiceError(499, "request_cancelled", "İstek durduruldu.")
+        finally:
+            for pending in (task, disconnected):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(task, disconnected, return_exceptions=True)
+
+    @app.get("/github/search")
+    async def github_search(
+        query: Annotated[str, Query(min_length=2, max_length=200)],
+        limit: Annotated[int, Query(ge=1, le=10)] = 5,
+    ):
+        try:
+            arguments = GitHubSearchArguments(query=query, limit=limit)
+        except ValidationError:
+            raise ServiceError(422, "validation_error", "Arama metni 2–200 karakter olmalı.")
+        repositories = await app.state.github.search(arguments)
+        return {"source": "GitHub REST API", "query": arguments.query, "count": len(repositories), "repositories": repositories}
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @app.get("/", include_in_schema=False)
+    async def index():
+        return FileResponse(ROOT / "frontend" / "index.html")
+
+    app.mount("/assets", StaticFiles(directory=ROOT / "frontend"), name="assets")
+    return app
 
 
-class Message(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str
-
-
-class ChatRequest(BaseModel):
-    model: str
-    messages: list[Message]
-
-
-@app.get("/models")
-def get_models():
-    return {"models": ALLOWED_MODELS}
-
-
-@app.post("/chat")
-async def chat(request: ChatRequest):
-    if request.model not in ALLOWED_MODELS:
-        raise HTTPException(
-            status_code=400,
-            detail="Geçersiz model"
-        )
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Sen yardımcı bir yapay zeka asistanısın. "
-                "Kullanıcı GitHub repository veya açık kaynak proje "
-                "araması istediğinde GitHub aracını kullan. "
-                "Araçtan gelmeyen repository bilgilerini uydurma."
-            )
-        },
-        *[
-            message.model_dump()
-            for message in request.messages
-        ]
-    ]
-
-    ollama_data = {
-        "model": request.model,
-        "messages": messages,
-        "tools": [GITHUB_SEARCH_TOOL],
-        "stream": False
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            # Birinci Ollama çağrısı: Araç gerekip gerekmediğine karar verir.
-            response = await client.post(
-                OLLAMA_CHAT_URL,
-                json=ollama_data
-            )
-            response.raise_for_status()
-            result = response.json()
-
-            assistant_message = result["message"]
-            tool_calls = assistant_message.get("tool_calls", [])
-
-            # Araç istenmediyse normal AI cevabını döndürür.
-            if not tool_calls:
-                return {
-                    "model": request.model,
-                    "answer": assistant_message["content"]
-                }
-
-            messages.append(assistant_message)
-
-            for tool_call in tool_calls:
-                function = tool_call.get("function", {})
-                function_name = function.get("name")
-                arguments = function.get("arguments", {})
-
-                if function_name != "search_github_repositories":
-                    tool_result = {
-                        "error": f"Bilinmeyen araç: {function_name}"
-                    }
-                else:
-                    query = str(arguments.get("query", "")).strip()
-
-                    try:
-                        limit = int(arguments.get("limit", 5))
-                    except (TypeError, ValueError):
-                        limit = 5
-
-                    limit = max(1, min(limit, 10))
-
-                    if len(query) < 2:
-                        tool_result = {
-                            "error": "GitHub sorgusu en az 2 karakter olmalı"
-                        }
-                    else:
-                        try:
-                            tool_result = await search_github_repositories(
-                                query=query,
-                                limit=limit
-                            )
-                        except HTTPException as exc:
-                            tool_result = {
-                                "error": exc.detail
-                            }
-
-                messages.append({
-                    "role": "tool",
-                    "tool_name": function_name,
-                    "content": json.dumps(
-                        tool_result,
-                        ensure_ascii=False
-                    )
-                })
-
-            # İkinci Ollama çağrısı: GitHub sonuçlarını yorumlar.
-            final_response = await client.post(
-                OLLAMA_CHAT_URL,
-                json={
-                    "model": request.model,
-                    "messages": messages,
-                    "tools": [GITHUB_SEARCH_TOOL],
-                    "stream": False
-                }
-            )
-            final_response.raise_for_status()
-            final_result = final_response.json()
-
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Ollama bağlantısı kurulamadı: {exc}"
-        )
-
-    return {
-        "model": request.model,
-        "answer": final_result["message"]["content"]
-    }
-@app.get("/github/search")
-async def github_search(
-    query: str = Query(min_length=2),
-    limit: int = Query(default=5, ge=1, le=10)
-):
-    repositories = await search_github_repositories(
-        query=query,
-        limit=limit
-    )
-
-    return {
-        "source": "GitHub REST API",
-        "query": query,
-        "count": len(repositories),
-        "repositories": repositories
-    }
+app = create_app()

@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 .env
 .env.*
+!.env.example
 .vscode/
 node_modules/
+.npm-cache/
 *.log
+.pytest_cache/
+test-results/
